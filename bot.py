@@ -148,6 +148,7 @@ SS_CHANNEL_ID = int(os.getenv("SS_CHANNEL_ID", "-1004416713458")) # Separate cha
 
 FREE_SP_DAILY_LIMIT = 15
 FREE_SP_COOLDOWN = 10
+MAX_PROXIES_PER_USER = 500
 
 # Updated PLANS with Trial
 PLANS = {
@@ -701,7 +702,7 @@ async def styled_reply(event, html_text, buttons=None, emoji_ids=None, file=None
     except:
         try:
             return await asyncio.wait_for(
-                event.reply(html_text[:4000], parse_mode='html', link_preview=False),
+                event.reply(html_text[:4000], buttons=buttons, parse_mode='html', link_preview=False),
                 timeout=10
             )
         except:
@@ -728,8 +729,18 @@ async def styled_edit(msg, html_text, buttons=None, emoji_ids=None):
             msg.edit(text, formatting_entities=entities, buttons=buttons, link_preview=False),
             timeout=8
         )
-    except:
-        pass
+        return True
+    except Exception:
+        # Some Telegram messages reject custom-emoji entities during edit.
+        # Retry with normal HTML so progress panels always reach their final report.
+        try:
+            await asyncio.wait_for(
+                msg.edit(html_text[:4000], buttons=buttons, parse_mode='html', link_preview=False),
+                timeout=8
+            )
+            return True
+        except Exception:
+            return False
 
 
 def pbtn(text, data=None, url=None):
@@ -1722,7 +1733,7 @@ async def info_cmd(event):
 {PE} <b>{bs('Expiry')}:</b> <code>{exp_str}</code>
 {PE} <b>{bs('Limit')}:</b> {limit_text}{usage_line}
 {PE} <b>{bs('Global Sites')}:</b> <code>{len(global_sites)}</code>
-{PE} <b>{bs('Proxies')}:</b> <code>{pc}/{bs('100')}</code>
+{PE} <b>{bs('Proxies')}:</b> <code>{pc}/{MAX_PROXIES_PER_USER}</code>
 {PE} <b>{bs('Redeemed Codes')}:</b> <code>{redeemed_count}</code>""", emoji_ids=[CE["fire"], CE["fire"], CE["info"], CE["star"], CE["crown"], CE["chart"], CE["globe"], CE["link"], CE["shield"], CE["gift"]])
 
 
@@ -1763,33 +1774,59 @@ async def add_site(event):
         PENDING_ADD_SITES[uid] = {"sites": new_sites, "exists": already_exists, "event": event}
         kb = [[pbtn(f"{bs('0-5 USD')}", f"addprice:5:{uid}"), pbtn(f"{bs('0-10 USD')}", f"addprice:10:{uid}")],
               [pbtn(f"{bs('0-20 USD')}", f"addprice:20:{uid}"), pbtn(f"{bs('0-40 USD')}", f"addprice:40:{uid}")]]
-        await styled_reply(event, ui_panel("SITE FILTER", f"📥 New sites       <code>{len(new_sites)}</code>\n↩ Existing        <code>{len(already_exists)}</code>\n\nChoose the maximum site price to test and add."), buttons=kb, emoji_ids=[CE["globe"]])
+        filter_message = await styled_reply(
+            event,
+            ui_panel("SITE FILTER", f"📥 New sites       <code>{len(new_sites)}</code>\n↩ Existing        <code>{len(already_exists)}</code>\n\nChoose the maximum site price to test and add."),
+            buttons=kb, emoji_ids=[CE["globe"]],
+        )
+        PENDING_ADD_SITES[uid]["filter_message"] = filter_message
     except Exception as e:
         await styled_reply(event, f"{PE} <b>{bs('Error')}:</b> <code>{e}</code>", emoji_ids=[CE["cross"]])
 
 
-@client.on(events.CallbackQuery(pattern=rb"addprice:(\d+):(\d+)"))
+@client.on(events.CallbackQuery(pattern=rb"^addprice:\d+:\d+$"))
 async def add_price_cb(event):
-    max_price = int(event.pattern_match.group(1).decode())
-    uid = int(event.pattern_match.group(2).decode())
-    if event.sender_id != uid: return await event.answer(f"{bs('Not yours')}!", alert=True)
-    data = PENDING_ADD_SITES.pop(uid, None)
-    if not data: return await event.answer(f"{bs('Expired')}!", alert=True)
-    if uid in ACTIVE_ADD_PROCESSES: return await event.answer(f"{bs('Already running')}!", alert=True)
-    ACTIVE_ADD_PROCESSES[uid] = True
-    await event.answer(f"{bs('Testing sites')}...")
-    try: await event.delete()
-    except: pass
-    asyncio.create_task(_process_add_sites(data["event"], data["sites"], data["exists"], max_price))
-
-
-async def _process_add_sites(event, new_sites, already_exists, max_price):
+    try:
+        raw = event.data.decode("utf-8") if isinstance(event.data, (bytes, bytearray)) else str(event.data)
+        parts = raw.split(":")
+        if len(parts) != 3 or parts[0] != "addprice":
+            return await event.answer("Invalid site filter", alert=True)
+        max_price = int(parts[1])
+        uid = int(parts[2])
+        if event.sender_id != uid:
+            return await event.answer(f"{bs('Not yours')}!", alert=True)
+        data = PENDING_ADD_SITES.pop(uid, None)
+        if not data:
+            return await event.answer(f"{bs('Expired')}!", alert=True)
+        if uid in ACTIVE_ADD_PROCESSES:
+            return await event.answer(f"{bs('Already running')}!", alert=True)
+        ACTIVE_ADD_PROCESSES[uid] = True
+        await event.answer(f"{bs('Testing sites')}...")
+        filter_message = data.get("filter_message")
+        if filter_message:
+            await styled_edit(filter_message, ui_panel("SITE CHECK", "⏳ <b>Starting site check...</b>"), buttons=[])
+        else:
+            try:
+                await event.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_process_add_sites(
+            data["event"], data["sites"], data["exists"], max_price,
+            status_message=filter_message,
+        ))
+    except Exception as exc:
+        log_user(getattr(event, "sender_id", 0), "ADD_PRICE_CALLBACK_ERROR", str(exc), "error")
+        try:
+            await event.answer("Could not start site check. Send /add again.", alert=True)
+        except Exception:
+            pass
+async def _process_add_sites(event, new_sites, already_exists, max_price, status_message=None):
     uid = event.sender_id
     total = len(new_sites); tested = working = dead = added_to_db = 0
     proxies = await get_all_user_proxies(uid)
     user_site_sem = get_user_sem(uid, "site")
     http_session = await get_user_http_session(uid, "site")
-    sm = await styled_reply(event, ui_panel('SITE CHECK', f'RUNNING   0 / {total}\n\n🌐 Sites        {total}\n✅ Working      0\n❌ Dead         0', hint='Site testing is in progress.'), emoji_ids=[CE['fire']])
+    sm = status_message or await styled_reply(event, ui_panel('SITE CHECK', f'RUNNING   0 / {total}\n\n🌐 Sites        {total}\n✅ Working      0\n❌ Dead         0', hint='Site testing is in progress.'), emoji_ids=[CE['fire']])
     last_ui = [0]; working_sites_data = []
     def is_stopped(): return uid not in ACTIVE_ADD_PROCESSES
     async def update_ui():
@@ -1894,19 +1931,32 @@ async def check_sites_cmd(event):
     await styled_reply(event, ui_panel("SITE AUDIT", f"🌐 Sites        <code>{len(sites)}</code>\n\nDead and over-price sites will be removed."), buttons=kb, emoji_ids=[CE["globe"]])
 
 
-@client.on(events.CallbackQuery(pattern=rb"siteprice:(\d+):(\d+)"))
+@client.on(events.CallbackQuery(pattern=rb"^siteprice:\d+:\d+$"))
 async def site_price_cb(event):
-    max_price = int(event.pattern_match.group(1).decode())
-    uid = int(event.pattern_match.group(2).decode())
-    if event.sender_id != uid: return await event.answer(f"{bs('Not yours')}!", alert=True)
-    data = PENDING_SITE_CHECK.pop(uid, None)
-    if not data: return await event.answer(f"{bs('Expired')}!", alert=True)
-    await event.answer(f"{bs('Checking')}...")
-    try: await event.delete()
-    except: pass
-    asyncio.create_task(_process_site_check(data["event"], data["sites"], max_price))
-
-
+    try:
+        raw = event.data.decode("utf-8") if isinstance(event.data, (bytes, bytearray)) else str(event.data)
+        parts = raw.split(":")
+        if len(parts) != 3 or parts[0] != "siteprice":
+            return await event.answer("Invalid site filter", alert=True)
+        max_price = int(parts[1])
+        uid = int(parts[2])
+        if event.sender_id != uid:
+            return await event.answer(f"{bs('Not yours')}!", alert=True)
+        data = PENDING_SITE_CHECK.pop(uid, None)
+        if not data:
+            return await event.answer(f"{bs('Expired')}!", alert=True)
+        await event.answer(f"{bs('Checking')}...")
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        asyncio.create_task(_process_site_check(data["event"], data["sites"], max_price))
+    except Exception as exc:
+        log_user(getattr(event, "sender_id", 0), "SITE_PRICE_CALLBACK_ERROR", str(exc), "error")
+        try:
+            await event.answer("Could not start site audit. Send /site again.", alert=True)
+        except Exception:
+            pass
 async def _process_site_check(event, sites, max_price):
     uid = event.sender_id
     total = len(sites); tested = alive_count = dead_count = kept_count = removed_price = 0
@@ -1978,14 +2028,14 @@ async def add_proxy_cmd(event):
         if not lines: return await styled_reply(event, ui_panel("PROXY LIBRARY", "⚠️ <b>No proxies found.</b>\nAdd proxies with <code>/addpxy</code>."), emoji_ids=[CE["cross"]])
         await ensure_user(event.sender_id)
         cc = await get_proxy_count(event.sender_id)
-        if cc >= 100: return await styled_reply(event, ui_panel("PROXY LIBRARY", "⚠️ <b>Proxy limit reached.</b>\nLimit <code>100 / 100</code>"), emoji_ids=[CE["cross"]])
+        if cc >= MAX_PROXIES_PER_USER: return await styled_reply(event, ui_panel("PROXY LIBRARY", "⚠️ <b>Proxy limit reached.</b>\nLimit <code>{MAX_PROXIES_PER_USER} / {MAX_PROXIES_PER_USER}</code>"), emoji_ids=[CE["cross"]])
         existing = {p['proxy_url'] for p in await get_all_user_proxies(event.sender_id)}
         parsed = []
         for l in lines:
             pd = parse_proxy_format(l)
             if pd and pd['proxy_url'] not in existing: parsed.append(pd); existing.add(pd['proxy_url'])
         if not parsed: return await styled_reply(event, ui_panel("PROXY CHECK", "❌ <b>No valid proxy entries found.</b>"), emoji_ids=[CE["cross"]])
-        parsed = parsed[:100-cc]
+        parsed = parsed[:MAX_PROXIES_PER_USER-cc]
         tm = await styled_reply(event, ui_panel("PROXY CHECK", f"RUNNING   0 / {len(parsed)}\n\n🧭 Proxies      {len(parsed)}\n✅ Working      0\n❌ Dead         0", hint="Proxy testing is in progress."), emoji_ids=[CE["shield"]])
         added, failed = [], []
         for i in range(0, len(parsed), 10):
@@ -1994,7 +2044,7 @@ async def add_proxy_cmd(event):
             for pd2, res in zip(batch, results):
                 if isinstance(res, tuple) and res[0]: await add_proxy_db(event.sender_id, pd2); added.append(1)
                 else: failed.append(1)
-        await styled_edit(tm, ui_panel("PROXY REPORT", f"✅ <b>Complete</b>\n✅ Added        {len(added)}\n❌ Failed       {len(failed)}\n📊 Total        {cc+len(added)}/100"), emoji_ids=[CE["fire"]])
+        await styled_edit(tm, ui_panel("PROXY REPORT", f"✅ <b>Complete</b>\n✅ Added        {len(added)}\n❌ Failed       {len(failed)}\n📊 Total        {cc+len(added)}/{MAX_PROXIES_PER_USER}"), emoji_ids=[CE["fire"]])
     except Exception as e:
         await styled_reply(event, f"{PE} <b>{bs('Error')}:</b> <code>{e}</code>", emoji_ids=[CE["cross"]])
 
@@ -2010,7 +2060,7 @@ async def view_proxies(event):
     if event.sender_id not in ADMIN_ID and not is_paid_plan(plan): return await send_premium_only_message(event)
     proxies = await get_all_user_proxies(event.sender_id)
     if not proxies: return await styled_reply(event, ui_panel("PROXY LIBRARY", "⚠️ <b>No proxies found.</b>\nAdd proxies with <code>/addpxy</code>."), emoji_ids=[CE["cross"]])
-    text = f"{PE} <b>{bs('Proxies')}</b> ({len(proxies)}/100) {PE}\n<b>━━━━━━━━━━━━━━━━━</b>\n"
+    text = f"{PE} <b>{bs('Proxies')}</b> ({len(proxies)}/{MAX_PROXIES_PER_USER}) {PE}\n<b>━━━━━━━━━━━━━━━━━</b>\n"
     eid = [CE["fire"], CE["fire"]]
     for i, p in enumerate(proxies[:30], 1): text += f"<code>{i}.</code> {PE} <b>{p['ip']}:{p['port']}</b>\n"; eid.append(CE["link"])
     if len(proxies) > 30: text += f"\n<i>+{len(proxies)-30} more</i>"
